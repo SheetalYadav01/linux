@@ -1,3 +1,5 @@
+static unsigned long exit_counters[KVM_EXIT_TYPES]; 
+static unsigned long total_exits;
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/kvm_host.h>
