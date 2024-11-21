@@ -4198,113 +4198,133 @@ static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu, bool spec_ctrl_in
 	guest_state_exit_irqoff();
 }
 
-static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu, bool force_immediate_exit) {
-    struct vcpu_svm *svm = to_svm(vcpu);
-    bool spec_ctrl_intercepted = msr_write_intercepted(vcpu, MSR_IA32_SPEC_CTRL);
+static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu,
+					  bool force_immediate_exit)
+{
+	struct vcpu_svm *svm = to_svm(vcpu);
+	bool spec_ctrl_intercepted = msr_write_intercepted(vcpu, MSR_IA32_SPEC_CTRL);
 
-    trace_kvm_entry(vcpu, force_immediate_exit);
+	trace_kvm_entry(vcpu, force_immediate_exit);
 
-    // Add counting and logging logic here
-    unsigned long exit_type = svm->vmcb->control.exit_code;
-    exit_counters[exit_type]++;
-    total_exits++;
+	svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
+	svm->vmcb->save.rsp = vcpu->arch.regs[VCPU_REGS_RSP];
+	svm->vmcb->save.rip = vcpu->arch.regs[VCPU_REGS_RIP];
 
-    if (total_exits % 10000 == 0) {
-        printk(KERN_INFO "Total Exits: %lu\n", total_exits);
-        for (int i = 0; i < KVM_EXIT_TYPES; i++) {
-            if (exit_counters[i] != 0) {
-                printk(KERN_INFO "Exit Type: %d, Count: %lu\n", i, exit_counters[i]);
-            }
-        }
-    }
+	/*
+	 * Disable singlestep if we're injecting an interrupt/exception.
+	 * We don't want our modified rflags to be pushed on the stack where
+	 * we might not be able to easily reset them if we disabled NMI
+	 * singlestep later.
+	 */
+	if (svm->nmi_singlestep && svm->vmcb->control.event_inj) {
+		/*
+		 * Event injection happens before external interrupts cause a
+		 * vmexit and interrupts are disabled here, so smp_send_reschedule
+		 * is enough to force an immediate vmexit.
+		 */
+		disable_nmi_singlestep(svm);
+		force_immediate_exit = true;
+	}
 
-    svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
-    svm->vmcb->save.rsp = vcpu->arch.regs[VCPU_REGS_RSP];
-    svm->vmcb->save.rip = vcpu->arch.regs[VCPU_REGS_RIP];
+	if (force_immediate_exit)
+		smp_send_reschedule(vcpu->cpu);
 
-    // Existing code continues...
-    if (svm->nmi_singlestep && svm->vmcb->control.event_inj) {
-        disable_nmi_singlestep(svm);
-        force_immediate_exit = true;
-    }
+	pre_svm_run(vcpu);
 
-    if (force_immediate_exit)
-        smp_send_reschedule(vcpu->cpu);
+	sync_lapic_to_cr8(vcpu);
 
-    pre_svm_run(vcpu);
-    sync_lapic_to_cr8(vcpu);
+	if (unlikely(svm->asid != svm->vmcb->control.asid)) {
+		svm->vmcb->control.asid = svm->asid;
+		vmcb_mark_dirty(svm->vmcb, VMCB_ASID);
+	}
+	svm->vmcb->save.cr2 = vcpu->arch.cr2;
 
-    if (unlikely(svm->asid != svm->vmcb->control.asid)) {
-        svm->vmcb->control.asid = svm->asid;
-        vmcb_mark_dirty(svm->vmcb, VMCB_ASID);
-    }
-    svm->vmcb->save.cr2 = vcpu->arch.cr2;
+	svm_hv_update_vp_id(svm->vmcb, vcpu);
 
-    svm_hv_update_vp_id(svm->vmcb, vcpu);
+	/*
+	 * Run with all-zero DR6 unless needed, so that we can get the exact cause
+	 * of a #DB.
+	 */
+	if (unlikely(vcpu->arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT))
+		svm_set_dr6(svm, vcpu->arch.dr6);
+	else
+		svm_set_dr6(svm, DR6_ACTIVE_LOW);
 
-    if (unlikely(vcpu->arch.switch_db_regs & KVM_DEBUGREG_WONT_EXIT))
-        svm_set_dr6(svm, vcpu->arch.dr6);
-    else
-        svm_set_dr6(svm, DR6_ACTIVE_LOW);
+	clgi();
+	kvm_load_guest_xsave_state(vcpu);
 
-    clgi();
-    kvm_load_guest_xsave_state(vcpu);
+	kvm_wait_lapic_expire(vcpu);
 
-    kvm_wait_lapic_expire(vcpu);
+	/*
+	 * If this vCPU has touched SPEC_CTRL, restore the guest's value if
+	 * it's non-zero. Since vmentry is serialising on affected CPUs, there
+	 * is no need to worry about the conditional branch over the wrmsr
+	 * being speculatively taken.
+	 */
+	if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL))
+		x86_spec_ctrl_set_guest(svm->virt_spec_ctrl);
 
-    if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL))
-        x86_spec_ctrl_set_guest(svm->virt_spec_ctrl);
+	svm_vcpu_enter_exit(vcpu, spec_ctrl_intercepted);
 
-    svm_vcpu_enter_exit(vcpu, spec_ctrl_intercepted);
+	if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL))
+		x86_spec_ctrl_restore_host(svm->virt_spec_ctrl);
 
-    if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL))
-        x86_spec_ctrl_restore_host(svm->virt_spec_ctrl);
+	if (!sev_es_guest(vcpu->kvm)) {
+		vcpu->arch.cr2 = svm->vmcb->save.cr2;
+		vcpu->arch.regs[VCPU_REGS_RAX] = svm->vmcb->save.rax;
+		vcpu->arch.regs[VCPU_REGS_RSP] = svm->vmcb->save.rsp;
+		vcpu->arch.regs[VCPU_REGS_RIP] = svm->vmcb->save.rip;
+	}
+	vcpu->arch.regs_dirty = 0;
 
-    if (!sev_es_guest(vcpu->kvm)) {
-        vcpu->arch.cr2 = svm->vmcb->save.cr2;
-        vcpu->arch.regs[VCPU_REGS_RAX] = svm->vmcb->save.rax;
-        vcpu->arch.regs[VCPU_REGS_RSP] = svm->vmcb->save.rsp;
-        vcpu->arch.regs[VCPU_REGS_RIP] = svm->vmcb->save.rip;
-    }
-    vcpu->arch.regs_dirty = 0;
+	if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
+		kvm_before_interrupt(vcpu, KVM_HANDLING_NMI);
 
-    if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
-        kvm_before_interrupt(vcpu, KVM_HANDLING_NMI);
+	kvm_load_host_xsave_state(vcpu);
+	stgi();
 
-    kvm_load_host_xsave_state(vcpu);
-    stgi();
+	/* Any pending NMI will happen here */
 
-    if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
-        kvm_after_interrupt(vcpu);
+	if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
+		kvm_after_interrupt(vcpu);
 
-    sync_cr8_to_lapic(vcpu);
+	sync_cr8_to_lapic(vcpu);
 
-    svm->next_rip = 0;
-    if (is_guest_mode(vcpu)) {
-        nested_sync_control_from_vmcb02(svm);
+	svm->next_rip = 0;
+	if (is_guest_mode(vcpu)) {
+		nested_sync_control_from_vmcb02(svm);
 
-        if (svm->nested.nested_run_pending && svm->vmcb->control.exit_code != SVM_EXIT_ERR)
-            ++vcpu->stat.nested_run;
+		/* Track VMRUNs that have made past consistency checking */
+		if (svm->nested.nested_run_pending &&
+		    svm->vmcb->control.exit_code != SVM_EXIT_ERR)
+                        ++vcpu->stat.nested_run;
 
-        svm->nested.nested_run_pending = 0;
-    }
+		svm->nested.nested_run_pending = 0;
+	}
 
-    svm->vmcb->control.tlb_ctl = TLB_CONTROL_DO_NOTHING;
-    vmcb_mark_all_clean(svm->vmcb);
+	svm->vmcb->control.tlb_ctl = TLB_CONTROL_DO_NOTHING;
+	vmcb_mark_all_clean(svm->vmcb);
 
-    if (svm->vmcb->control.exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR)
-        vcpu->arch.apf.host_apf_flags = kvm_read_and_reset_apf_flags();
+	/* if exit due to PF check for async PF */
+	if (svm->vmcb->control.exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR)
+		vcpu->arch.apf.host_apf_flags =
+			kvm_read_and_reset_apf_flags();
 
-    vcpu->arch.regs_avail &= ~SVM_REGS_LAZY_LOAD_SET;
+	vcpu->arch.regs_avail &= ~SVM_REGS_LAZY_LOAD_SET;
 
-    if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_EXCP_BASE + MC_VECTOR))
-        svm_handle_mce(vcpu);
+	/*
+	 * We need to handle MC intercepts here before the vcpu has a chance to
+	 * change the physical cpu
+	 */
+	if (unlikely(svm->vmcb->control.exit_code ==
+		     SVM_EXIT_EXCP_BASE + MC_VECTOR))
+		svm_handle_mce(vcpu);
 
-    trace_kvm_exit(vcpu, KVM_ISA_SVM);
+	trace_kvm_exit(vcpu, KVM_ISA_SVM);
 
-    svm_complete_interrupts(vcpu);
+	svm_complete_interrupts(vcpu);
 
-    return svm_exit_handlers_fastpath(vcpu);
+	return svm_exit_handlers_fastpath(vcpu);
 }
 
 static void svm_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa,
