@@ -1,18 +1,114 @@
-Linux kernel
-============
+CMPE283 Assignment 2: KVM Exit Statistics
 
-There are several guides for kernel developers and users. These guides can
-be rendered in a number of formats, like HTML and PDF. Please read
-Documentation/admin-guide/README.rst first.
+Team Members
+•	Sheetal Yadav : https://github.com/SheetalYadav01/linux
+•	Amrutha 
 
-In order to build the documentation, use ``make htmldocs`` or
-``make pdfdocs``.  The formatted documentation can also be read online at:
+Question 1
 
-    https://www.kernel.org/doc/html/latest/
+Sheetal Yadav took the lead in implementing the project setup. She ensured the Google Cloud Platform (GCP) project was created with nested virtualization enabled, and the outer VM was successfully set up on Google Cloud Platform. She also installed KVM and the necessary development tools, and configured the Linux server. 
+Amrutha Junnuri focused on researching and supporting the project steps. This included providing guidance and documentation support throughout the process. She also installed and configured the inner VM, ensuring it was set up correctly and ready for testing.
+We both worked together in test the process and troubleshooting any configuration or environment-related issues.
 
-There are various text files in the Documentation/ subdirectory,
-several of them using the reStructuredText markup notation.
+Question 2
 
-Please read the Documentation/process/changes.rst file, as it contains the
-requirements for building and running the kernel, and information about
-the problems which may result by upgrading your kernel.
+Development Steps
+
+Step 1:  Performed the setup of Google Cloud Platform (GCP) account
+1.	Created a new project named "nested-virt"
+2.	Install Google Cloud SDK on local machine
+3.	Enable Compute Engine API , after installing logged into gcloud
+ 
+       gcloud config set project nested-virt
+
+Step 2:  Created the nested Outer VM in us-central1-a
+
+
+gcloud compute instances create outer-vm \ --machine-type=e2-standard-4 \ --image-family=ubuntu-2204-lts \ --image-project=ubuntu-os-cloud \ --zone=us-central1-a
+
+Running outer VM
+
+
+ 
+
+Step 3: Perfromed the SSH into Outer VM
+
+gcloud compute ssh --zone "us-central1-a" "outer-vm" --project "nested-virt-441000"
+
+ 
+
+
+Step 4: Performed the necessary update and installation of toold on VM Environment to to build the linux kernel
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y build-essential git fakeroot libncurses5-dev libssl-dev bc bison flex libelf-dev
+
+Step 5: Fork the code into the github repo for Linux kernel build from below mentioned link
+
+ https://github.com/torvalds/linux
+
+https://github.com/SheetalYadav01/linux
+
+
+Step 6: Performed the new Kernal installation
+•	Configured the kernel for the VM:  make defconfig
+•	Build the kernel : make -j$(nproc)
+•	
+•	Installed the new kernel:   sudo make modules_install
+                                                         sudo make install
+•	Update the bootloader and reboot:
+              sudo update-grub
+              sudo reboot
+             
+•	Reconnect the VM after reboot:   gcloud compute ssh outer-vm --zone=us-central1-a
+
+ 
+
+
+
+ 
+
+ 
+
+
+Step 7: Modified the KVM code 
+•	Located the KVM exit handler code in the kernel source code
+at path arch/x86/kvm/vmx/vmx.c
+•	Added counters for each exit type and printed statistics every 10,000 exits. 
+•	Rebuilt and installed the modified kernel.
+  
+
+Step 8: Rebuild the Kernel with new changes
+
+make -j$(nproc)
+sudo make modules_install
+sudo make install
+sudo update-grub
+sudo reboot
+
+
+•	Reconnected to the VM after reboot:
+gcloud compute ssh outer-vm --zone=us-central1-a
+
+
+Step 9: Tested the Modified Kernel
+Created an inner VM on the outer VM: 
+ 
+
+Installed QEMU and KVM:
+sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils
+
+Started a virtual machine using QEMU:	
+qemu-system-x86_64 -enable-kvm -m 2048 -hda <inner-vm.img >
+
+Constantly monitored the kernel logs to see the VM exit stats in interval of time
+dmesg | tail -n 50
+
+
+Question 3: Frequency of Exits
+The number of exits generally increases at a steady rate during normal VM operations. However, specific activities like booting the VM or performing heavy I/O operations cause noticeable spikes in exit counts. These spikes are due to the intensive processes involved in these operations. For example, exit types such as 30 (Unknown) and 28 (Unknown) are among the most frequently observed, each exceeding a million instances, because they are often invoked during critical operations managed by the hypervisor. Additionally, exit types like 1 (External Interrupt) and 10 (CPUID) also significantly contribute to the overall exit count. On average, a complete VM boot involves approximately 1.5 to 2 million exits, with periods of heightened activity reflecting the intensive tasks being performed.
+
+Question 4: Most and Least Frequent Exit Types
+Among the various exit types observed during VM runtime, Exit Reason 30 (Unknown) and Exit Reason 28 (Unknown) are the most frequent. These exit types occur often during operations such as CPU initialization and interrupt handling, making them the bulk of the exit events. Collectively, these exits surpass a million instances. On the other hand, the least frequent exit type observed is Exit Reason 0 (Exception or NMI), which rarely occurs, indicating that exception handling and non-maskable interrupts are not commonly needed during regular VM operations.
+
+
